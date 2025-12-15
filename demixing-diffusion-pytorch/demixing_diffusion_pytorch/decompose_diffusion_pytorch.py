@@ -283,7 +283,8 @@ class DecomposeTrainer(object):
                 batches = self.batch_size
                 with torch.no_grad():
                     batch_list = [next(dl).cuda() for dl in self.dataloaders]
-                    x1_0s, x_ts = self.ema_model.all_sample(batch_size=batches, xs=batch_list)
+                    _ema = self.ema_model.module if hasattr(self.ema_model, 'module') else self.ema_model
+                    x1_0s, x_ts = _ema.all_sample(batch_size=batches, xs=batch_list)
                     og_imgs = batch_list[0]
                     og_imgs = (og_imgs + 1) * 0.5
                     utils.save_image(og_imgs, str(self.results_folder / f'sample-og-{milestone}.png'), nrow=6)
@@ -325,7 +326,8 @@ class DecomposeTrainer(object):
     def test_from_data(self, extra_path, s_times=None):
         batches = self.batch_size
         batch_list = [next(dl).cuda() for dl in self.dataloaders]
-        X_0s, X_ts = self.ema_model.all_sample(batch_size=batches, xs=batch_list, times=s_times)
+        _ema = self.ema_model.module if hasattr(self.ema_model, 'module') else self.ema_model
+        X_0s, X_ts = _ema.all_sample(batch_size=batches, xs=batch_list, times=s_times)
         og_img = (batch_list[0] + 1) * 0.5
         utils.save_image(og_img, str(self.results_folder / f'og-{extra_path}.png'), nrow=6)
         import imageio
