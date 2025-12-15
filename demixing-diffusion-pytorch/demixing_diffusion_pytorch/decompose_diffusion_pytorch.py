@@ -144,7 +144,8 @@ class Dataset_Aug(data.Dataset):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        allowed_exts = set(['.' + e.lower() for e in exts])
+        self.paths = [p for p in Path(folder).rglob('*') if p.is_file() and p.suffix.lower() in allowed_exts]
         self.transform = transforms.Compose([
             transforms.Resize((int(image_size * 1.12), int(image_size * 1.12))),
             transforms.RandomCrop(image_size),
@@ -165,7 +166,8 @@ class Dataset_Center(data.Dataset):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        allowed_exts = set(['.' + e.lower() for e in exts])
+        self.paths = [p for p in Path(folder).rglob('*') if p.is_file() and p.suffix.lower() in allowed_exts]
         self.transform = transforms.Compose([
             transforms.Resize((int(image_size * 1.12), int(image_size * 1.12))),
             transforms.CenterCrop(image_size),
@@ -226,6 +228,9 @@ class DecomposeTrainer(object):
         else:
             ds_cls = Dataset_Center
         self.datasets = [ds_cls(folder, image_size) for folder in folders]
+        for ds, folder in zip(self.datasets, folders):
+            if len(ds) == 0:
+                raise ValueError(f'No images found in folder "{folder}" with supported extensions.')
         self.dataloaders = [cycle(data.DataLoader(ds, batch_size=train_batch_size, shuffle=shuffle, pin_memory=True, num_workers=8, drop_last=True)) for ds in self.datasets]
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.step = 0
