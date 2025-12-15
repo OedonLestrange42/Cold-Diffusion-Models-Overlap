@@ -1,2 +1,3 @@
 from demixing_diffusion_pytorch.demixing_diffusion_pytorch import GaussianDiffusion, Unet, Trainer
+from demixing_diffusion_pytorch.decompose_diffusion_pytorch import DecomposeDiffusion, DecomposeTrainer
 
