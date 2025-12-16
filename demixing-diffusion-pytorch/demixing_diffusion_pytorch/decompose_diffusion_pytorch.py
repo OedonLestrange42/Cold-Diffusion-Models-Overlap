@@ -100,11 +100,10 @@ class DecomposeDiffusion(nn.Module):
 
     def q_sample_sum(self, xs, t):
         b = xs[0].shape[0]
-        k = self.k_of_t(t)
         x_sum = torch.zeros_like(xs[0])
-        for i in range(xs.__len__()):
-            use_mask = (k > i).type_as(x_sum).view(b, 1, 1, 1)
-            x_sum = x_sum + xs[i] * use_mask
+        for i in range(len(xs)):
+            x_sum = x_sum + xs[i]
+        k = torch.full((b,), len(xs), dtype=torch.long, device=xs[0].device)
         xt = self.normalize_sum(x_sum, k)
         return xt
 
@@ -123,7 +122,9 @@ class DecomposeDiffusion(nn.Module):
     def forward(self, xs, *args, **kwargs):
         b, c, h, w, device, img_size = *xs[0].shape, xs[0].device, self.image_size
         assert h == img_size and w == img_size
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        t = kwargs.get('t', None)
+        if t is None:
+            t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         return self.p_losses(xs, t, *args, **kwargs)
 
     @torch.no_grad()
@@ -228,6 +229,8 @@ class DecomposeTrainer(object):
         else:
             ds_cls = Dataset_Center
         self.datasets = [ds_cls(folder, image_size) for folder in folders]
+        if len(self.datasets) != 2:
+            raise ValueError('Require exactly two data_paths: target first, interference second.')
         for ds, folder in zip(self.datasets, folders):
             if len(ds) == 0:
                 raise ValueError(f'No images found in folder "{folder}" with supported extensions.')
@@ -266,8 +269,11 @@ class DecomposeTrainer(object):
         while self.step < self.train_num_steps:
             u_loss = 0
             for _ in range(self.gradient_accumulate_every):
-                batch_list = [next(dl).cuda() for dl in self.dataloaders]
-                loss = torch.mean(self.model(batch_list))
+                x_target = next(self.dataloaders[0]).cuda()
+                s = int(torch.randint(1, self.model.num_timesteps + 1, (1,), device=x_target.device).item())
+                xs_list = [x_target] + [next(self.dataloaders[1]).cuda() for _ in range(s)]
+                step = torch.full((x_target.shape[0],), s - 1, dtype=torch.long, device=x_target.device)
+                loss = torch.mean(self.model(xs_list, t=step))
                 u_loss += loss.item()
                 backwards(loss / self.gradient_accumulate_every)
             acc_loss = acc_loss + (u_loss / self.gradient_accumulate_every)
