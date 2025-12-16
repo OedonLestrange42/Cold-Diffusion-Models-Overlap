@@ -310,6 +310,20 @@ class DecomposeTrainer(object):
                     utils.save_image(recons, str(self.results_folder / f'sample-recon-{milestone}.png'), nrow=6)
                     xt0 = (x_ts[-1] + 1) * 0.5
                     utils.save_image(xt0, str(self.results_folder / f'sample-xt0-{milestone}.png'), nrow=6)
+                    import imageio
+                    fwd_frames = []
+                    rev_frames = []
+                    X_ts_forward = list(reversed(x_ts))
+                    for i in range(len(X_ts_forward)):
+                        xt_f = (X_ts_forward[i] + 1) * 0.5
+                        utils.save_image(xt_f, str(self.results_folder / f'fwd-{milestone}-{i}.png'), nrow=6)
+                        fwd_frames.append(imageio.imread(str(self.results_folder / f'fwd-{milestone}-{i}.png')))
+                    for i in range(len(x1_0s)):
+                        x0_r = (x1_0s[i] + 1) * 0.5
+                        utils.save_image(x0_r, str(self.results_folder / f'rev-{milestone}-{i}.png'), nrow=6)
+                        rev_frames.append(imageio.imread(str(self.results_folder / f'rev-{milestone}-{i}.png')))
+                    imageio.mimsave(str(self.results_folder / f'Gif-forward-{milestone}.gif'), fwd_frames)
+                    imageio.mimsave(str(self.results_folder / f'Gif-reverse-{milestone}.gif'), rev_frames)
                     if self.use_wandb and self.wandb_run is not None:
                         import wandb
                         from torchvision.utils import make_grid
@@ -317,6 +331,12 @@ class DecomposeTrainer(object):
                             "og": wandb.Image(make_grid(og_imgs, nrow=6)),
                             "recon": wandb.Image(make_grid(recons, nrow=6)),
                             "xt0": wandb.Image(make_grid(xt0, nrow=6)),
+                            "fwd_first": wandb.Image(make_grid((X_ts_forward[0] + 1) * 0.5, nrow=6)),
+                            "fwd_mid": wandb.Image(make_grid((X_ts_forward[len(X_ts_forward) // 2] + 1) * 0.5, nrow=6)),
+                            "fwd_last": wandb.Image(make_grid((X_ts_forward[-1] + 1) * 0.5, nrow=6)),
+                            "rev_first": wandb.Image(make_grid((x1_0s[0] + 1) * 0.5, nrow=6)),
+                            "rev_mid": wandb.Image(make_grid((x1_0s[len(x1_0s) // 2] + 1) * 0.5, nrow=6)),
+                            "rev_last": wandb.Image(make_grid((x1_0s[-1] + 1) * 0.5, nrow=6)),
                             "milestone": milestone,
                             "step": self.step
                         })
