@@ -122,10 +122,9 @@ class DecomposeDiffusion(nn.Module):
     def forward(self, xs, *args, **kwargs):
         b, c, h, w, device, img_size = *xs[0].shape, xs[0].device, self.image_size
         assert h == img_size and w == img_size
-        t = kwargs.get('t', None)
-        if t is None:
-            t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(xs, t, *args, **kwargs)
+        t_kw = kwargs.pop('t', None)
+        t = t_kw if t_kw is not None else torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        return self.p_losses(xs, t)
 
     @torch.no_grad()
     def all_sample(self, batch_size=16, xs=None, times=None):
