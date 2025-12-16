@@ -127,16 +127,28 @@ class DecomposeDiffusion(nn.Module):
         return self.p_losses(xs, t)
 
     @torch.no_grad()
-    def all_sample(self, batch_size=16, xs=None, times=None):
+    def all_sample(self, batch_size=16, xs=None, times=None, interference_dl=None):
         self.denoise_fn.eval()
         t = self.num_timesteps if times is None else times
         X1_0s, X_ts = [], []
-        for step_val in range(t, 0, -1):
-            step = torch.full((batch_size,), step_val - 1, dtype=torch.long, device=xs[0].device)
-            x_mix = self.q_sample_sum(xs=xs, t=step)
-            x1_bar = self.denoise_fn(x_mix, step)
-            X1_0s.append(x1_bar.detach().cpu())
-            X_ts.append(x_mix.detach().cpu())
+        if interference_dl is None:
+            for step_val in range(t, 0, -1):
+                step = torch.full((batch_size,), step_val - 1, dtype=torch.long, device=xs[0].device)
+                x_mix = self.q_sample_sum(xs=xs, t=step)
+                x1_bar = self.denoise_fn(x_mix, step)
+                X1_0s.append(x1_bar.detach().cpu())
+                X_ts.append(x_mix.detach().cpu())
+        else:
+            x_target = xs[0]
+            pool = [next(interference_dl).cuda() for _ in range(t)]
+            for step_val in range(t, 0, -1):
+                step = torch.full((batch_size,), step_val - 1, dtype=torch.long, device=x_target.device)
+                k_val = min(1 + (step_val - 1), 1 + len(pool))
+                xs_step = [x_target] + pool[:max(0, k_val - 1)]
+                x_mix = self.q_sample_sum(xs=xs_step, t=step)
+                x1_bar = self.denoise_fn(x_mix, step)
+                X1_0s.append(x1_bar.detach().cpu())
+                X_ts.append(x_mix.detach().cpu())
         return X1_0s, X_ts
 
 class Dataset_Aug(data.Dataset):
@@ -288,15 +300,15 @@ class DecomposeTrainer(object):
                 milestone = self.step // self.save_and_sample_every
                 batches = self.batch_size
                 with torch.no_grad():
-                    batch_list = [next(dl).cuda() for dl in self.dataloaders]
+                    x_target = next(self.dataloaders[0]).cuda()
                     _ema = self.ema_model.module if hasattr(self.ema_model, 'module') else self.ema_model
-                    x1_0s, x_ts = _ema.all_sample(batch_size=batches, xs=batch_list)
-                    og_imgs = batch_list[0]
+                    x1_0s, x_ts = _ema.all_sample(batch_size=batches, xs=[x_target], interference_dl=self.dataloaders[1])
+                    og_imgs = x_target
                     og_imgs = (og_imgs + 1) * 0.5
                     utils.save_image(og_imgs, str(self.results_folder / f'sample-og-{milestone}.png'), nrow=6)
-                    recons = (x1_0s[0] + 1) * 0.5
+                    recons = (x1_0s[-1] + 1) * 0.5
                     utils.save_image(recons, str(self.results_folder / f'sample-recon-{milestone}.png'), nrow=6)
-                    xt0 = (x_ts[0] + 1) * 0.5
+                    xt0 = (x_ts[-1] + 1) * 0.5
                     utils.save_image(xt0, str(self.results_folder / f'sample-xt0-{milestone}.png'), nrow=6)
                     if self.use_wandb and self.wandb_run is not None:
                         import wandb
@@ -331,10 +343,10 @@ class DecomposeTrainer(object):
     @torch.no_grad()
     def test_from_data(self, extra_path, s_times=None):
         batches = self.batch_size
-        batch_list = [next(dl).cuda() for dl in self.dataloaders]
+        x_target = next(self.dataloaders[0]).cuda()
         _ema = self.ema_model.module if hasattr(self.ema_model, 'module') else self.ema_model
-        X_0s, X_ts = _ema.all_sample(batch_size=batches, xs=batch_list, times=s_times)
-        og_img = (batch_list[0] + 1) * 0.5
+        X_0s, X_ts = _ema.all_sample(batch_size=batches, xs=[x_target], times=s_times, interference_dl=self.dataloaders[1])
+        og_img = (x_target + 1) * 0.5
         utils.save_image(og_img, str(self.results_folder / f'og-{extra_path}.png'), nrow=6)
         import imageio
         frames_t = []
@@ -359,7 +371,7 @@ class DecomposeTrainer(object):
             wandb.log({
                 "test_og": wandb.Image(make_grid(og_img, nrow=6)),
                 "test_x0_last": wandb.Image(make_grid((X_0s[-1] + 1) * 0.5, nrow=6)),
-                "test_xt_first": wandb.Image(make_grid((X_ts[0] + 1) * 0.5, nrow=6))
+                "test_xt_last": wandb.Image(make_grid((X_ts[-1] + 1) * 0.5, nrow=6))
             })
         try:
             fid_value = calculate_fid_given_samples(
