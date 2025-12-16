@@ -270,7 +270,8 @@ class DecomposeTrainer(object):
             u_loss = 0
             for _ in range(self.gradient_accumulate_every):
                 x_target = next(self.dataloaders[0]).cuda()
-                s = int(torch.randint(1, self.model.num_timesteps + 1, (1,), device=x_target.device).item())
+                _model = self.model.module if hasattr(self.model, 'module') else self.model
+                s = int(torch.randint(1, _model.num_timesteps + 1, (1,), device=x_target.device).item())
                 xs_list = [x_target] + [next(self.dataloaders[1]).cuda() for _ in range(s)]
                 step = torch.full((x_target.shape[0],), s - 1, dtype=torch.long, device=x_target.device)
                 loss = torch.mean(self.model(xs_list, t=step))
