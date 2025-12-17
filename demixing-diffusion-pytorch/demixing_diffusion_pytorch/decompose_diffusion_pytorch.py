@@ -310,9 +310,12 @@ class DecomposeTrainer(object):
                     utils.save_image(recons, str(self.results_folder / f'sample-recon-{milestone}.png'), nrow=6)
                     xt0 = (x_ts[-1] + 1) * 0.5
                     utils.save_image(xt0, str(self.results_folder / f'sample-xt0-{milestone}.png'), nrow=6)
+                    noise_last = torch.clamp(x_ts[-1] - x1_0s[-1], -1, 1)
+                    utils.save_image((noise_last + 1) * 0.5, str(self.results_folder / f'sample-noise-{milestone}.png'), nrow=6)
                     import imageio
                     fwd_frames = []
                     rev_frames = []
+                    noise_frames = []
                     X_ts_forward = list(reversed(x_ts))
                     for i in range(len(X_ts_forward)):
                         xt_f = (X_ts_forward[i] + 1) * 0.5
@@ -322,8 +325,13 @@ class DecomposeTrainer(object):
                         x0_r = (x1_0s[i] + 1) * 0.5
                         utils.save_image(x0_r, str(self.results_folder / f'rev-{milestone}-{i}.png'), nrow=6)
                         rev_frames.append(imageio.imread(str(self.results_folder / f'rev-{milestone}-{i}.png')))
+                        noise_i = torch.clamp(x_ts[i] - x1_0s[i], -1, 1)
+                        noise_i_v = (noise_i + 1) * 0.5
+                        utils.save_image(noise_i_v, str(self.results_folder / f'noise-{milestone}-{i}.png'), nrow=6)
+                        noise_frames.append(imageio.imread(str(self.results_folder / f'noise-{milestone}-{i}.png')))
                     imageio.mimsave(str(self.results_folder / f'Gif-forward-{milestone}.gif'), fwd_frames)
                     imageio.mimsave(str(self.results_folder / f'Gif-reverse-{milestone}.gif'), rev_frames)
+                    imageio.mimsave(str(self.results_folder / f'Gif-noise-{milestone}.gif'), noise_frames)
                     if self.use_wandb and self.wandb_run is not None:
                         import wandb
                         from torchvision.utils import make_grid
@@ -337,6 +345,9 @@ class DecomposeTrainer(object):
                             "rev_first": wandb.Image(make_grid((x1_0s[0] + 1) * 0.5, nrow=6)),
                             "rev_mid": wandb.Image(make_grid((x1_0s[len(x1_0s) // 2] + 1) * 0.5, nrow=6)),
                             "rev_last": wandb.Image(make_grid((x1_0s[-1] + 1) * 0.5, nrow=6)),
+                            "noise_first": wandb.Image(make_grid(((torch.clamp(x_ts[0] - x1_0s[0], -1, 1) + 1) * 0.5), nrow=6)),
+                            "noise_mid": wandb.Image(make_grid(((torch.clamp(x_ts[len(x_ts) // 2] - x1_0s[len(x1_0s) // 2], -1, 1) + 1) * 0.5), nrow=6)),
+                            "noise_last": wandb.Image(make_grid(((torch.clamp(x_ts[-1] - x1_0s[-1], -1, 1) + 1) * 0.5), nrow=6)),
                             "milestone": milestone,
                             "step": self.step
                         })
@@ -371,6 +382,7 @@ class DecomposeTrainer(object):
         import imageio
         frames_t = []
         frames_0 = []
+        frames_n = []
         for i in range(len(X_0s)):
             x_0 = X_0s[i]
             x_0 = (x_0 + 1) * 0.5
@@ -380,8 +392,13 @@ class DecomposeTrainer(object):
             all_images = (x_t + 1) * 0.5
             utils.save_image(all_images, str(self.results_folder / f'sample-{i}-{extra_path}-xt.png'), nrow=6)
             frames_t.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-xt.png')))
+            noise_i = torch.clamp(x_t - X_0s[i], -1, 1)
+            noise_i_v = (noise_i + 1) * 0.5
+            utils.save_image(noise_i_v, str(self.results_folder / f'sample-{i}-{extra_path}-noise.png'), nrow=6)
+            frames_n.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-noise.png")))
         imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-x0.gif'), frames_0)
         imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-xt.gif'), frames_t)
+        imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-noise.gif'), frames_n)
         if self.use_wandb and self.wandb_run is None:
             import wandb
             self.wandb_run = wandb.init(project=self.wandb_project, name=self.wandb_run_name)
@@ -391,7 +408,8 @@ class DecomposeTrainer(object):
             wandb.log({
                 "test_og": wandb.Image(make_grid(og_img, nrow=6)),
                 "test_x0_last": wandb.Image(make_grid((X_0s[-1] + 1) * 0.5, nrow=6)),
-                "test_xt_last": wandb.Image(make_grid((X_ts[-1] + 1) * 0.5, nrow=6))
+                "test_xt_last": wandb.Image(make_grid((X_ts[-1] + 1) * 0.5, nrow=6)),
+                "test_noise_last": wandb.Image(make_grid(((torch.clamp(X_ts[-1] - X_0s[-1], -1, 1) + 1) * 0.5), nrow=6))
             })
         try:
             fid_value = calculate_fid_given_samples(
