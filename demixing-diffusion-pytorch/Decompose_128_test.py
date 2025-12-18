@@ -89,7 +89,22 @@ def _save_sequence(X_0s, X_ts, save_folder, tag):
     imageio.mimsave(str(Path(save_folder) / f'Gif-{tag}-xt.gif'), frames_t)
     imageio.mimsave(str(Path(save_folder) / f'Gif-{tag}-noise.gif'), frames_n)
 
-if args.test_type in ['train_data', 'test_data']:
+if (args.image_dir is not None) or (args.test_type == 'image_dir'):
+    paths = _list_images(args.image_dir)
+    if len(paths) == 0:
+        raise ValueError('No images found in --image_dir')
+    tfm = _transform(128)
+    xs = []
+    for p in paths:
+        xs.append(_load_tensor(p, tfm))
+    _model = diffusion.module if hasattr(diffusion, 'module') else diffusion
+    _model.num_sources = len(xs)
+    X_0s, X_ts = _model.all_sample(batch_size=1, xs=xs, times=args.time_steps)
+    tag = os.path.basename(os.path.abspath(args.image_dir))
+    xt_last = (X_ts[-1] + 1) * 0.5
+    utils.save_image(xt_last, str(Path(args.save_folder) / f'overlap-{tag}.png'), nrow=1)
+    _save_sequence(X_0s, X_ts, args.save_folder, tag)
+elif args.test_type in ['train_data', 'test_data']:
     if args.data_paths is None or len(args.data_paths) != 2:
         raise ValueError('Require --data_paths with exactly two folders: target first, interference second.')
     trainer = DecomposeTrainer(
@@ -109,20 +124,5 @@ if args.test_type in ['train_data', 'test_data']:
         wandb_run_name=args.wandb_run_name
     )
     trainer.test_from_data(args.test_type.split('_')[0], s_times=None)
-elif args.image_dir is not None:
-    paths = _list_images(args.image_dir)
-    if len(paths) == 0:
-        raise ValueError('No images found in --image_dir')
-    tfm = _transform(128)
-    xs = []
-    for p in paths:
-        xs.append(_load_tensor(p, tfm))
-    _model = diffusion.module if hasattr(diffusion, 'module') else diffusion
-    _model.num_sources = len(xs)
-    X_0s, X_ts = _model.all_sample(batch_size=1, xs=xs, times=args.time_steps)
-    tag = os.path.basename(os.path.abspath(args.image_dir))
-    xt_last = (X_ts[-1] + 1) * 0.5
-    utils.save_image(xt_last, str(Path(args.save_folder) / f'overlap-{tag}.png'), nrow=1)
-    _save_sequence(X_0s, X_ts, args.save_folder, tag)
 else:
     raise ValueError('Specify --image_dir for overlap test or use --data_paths with test_type.')
