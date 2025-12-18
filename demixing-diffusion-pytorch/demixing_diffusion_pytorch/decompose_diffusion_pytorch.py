@@ -44,6 +44,11 @@ def cosine_beta_schedule(timesteps, s=0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
 def create_folder(path):
     try:
         os.mkdir(path)
@@ -87,6 +92,8 @@ class DecomposeDiffusion(nn.Module):
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
 
     def k_of_t(self, t):
         k = 1 + torch.floor((self.num_sources - 1) * (t.float() + 1) / self.num_timesteps).long()
@@ -99,17 +106,31 @@ class DecomposeDiffusion(nn.Module):
         return torch.clamp(out, -1.0, 1.0)
 
     def q_sample_sum(self, xs, t):
-        b = xs[0].shape[0]
-        x_sum = torch.zeros_like(xs[0])
-        for i in range(len(xs)):
+        if len(xs) < 2:
+            return torch.clamp(xs[0], -1.0, 1.0)
+        x_sum = torch.zeros_like(xs[1])
+        for i in range(1, len(xs)):
             x_sum = x_sum + xs[i]
-        k = torch.full((b,), len(xs), dtype=torch.long, device=xs[0].device)
-        xt = self.normalize_sum(x_sum, k)
-        return xt
+        k = torch.full((xs[0].shape[0],), max(1, len(xs) - 1), dtype=torch.long, device=xs[0].device)
+        noise = self.normalize_sum(x_sum, k)
+        return noise
+
+    def q_sample(self, x_start, x_end, t):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_end
+        )
+
+    def get_x2_bar_from_xt(self, x1_bar, xt, t):
+        return (
+            (xt - extract(self.sqrt_alphas_cumprod, t, x1_bar.shape) * x1_bar) /
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x1_bar.shape)
+        )
 
     def p_losses(self, xs, t):
         x_start = xs[0]
-        x_mix = self.q_sample_sum(xs=xs, t=t)
+        x_end = self.q_sample_sum(xs=xs, t=t)
+        x_mix = self.q_sample(x_start=x_start, x_end=x_end, t=t)
         x_recon = self.denoise_fn(x_mix, t)
         if self.loss_type == 'l1':
             loss = (x_start - x_recon).abs().mean()
@@ -129,26 +150,57 @@ class DecomposeDiffusion(nn.Module):
     @torch.no_grad()
     def all_sample(self, batch_size=16, xs=None, times=None, interference_dl=None):
         self.denoise_fn.eval()
-        t = self.num_timesteps if times is None else times
+        total_steps = self.num_timesteps if times is None else int(times)
         X1_0s, X_ts = [], []
         if interference_dl is None:
-            for step_val in range(t, 0, -1):
-                step = torch.full((batch_size,), step_val - 1, dtype=torch.long, device=xs[0].device)
-                x_mix = self.q_sample_sum(xs=xs, t=step)
-                x1_bar = self.denoise_fn(x_mix, step)
+            if xs is None or len(xs) == 0:
+                raise ValueError("xs must be provided when interference_dl is None.")
+            device = xs[0].device
+            step_t = torch.full((batch_size,), total_steps - 1, dtype=torch.long, device=device)
+            x_end = self.q_sample_sum(xs=xs, t=step_t)
+            img = self.q_sample(x_start=xs[0], x_end=x_end, t=step_t)
+            t = total_steps
+            while t:
+                step = torch.full((batch_size,), t - 1, dtype=torch.long, device=device)
+                x1_bar = self.denoise_fn(img, step)
+                x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
                 X1_0s.append(x1_bar.detach().cpu())
-                X_ts.append(x_mix.detach().cpu())
+                X_ts.append(img.detach().cpu())
+                xt_bar = x1_bar
+                if t != 0:
+                    xt_bar = self.q_sample(x_start=xt_bar, x_end=x2_bar, t=step)
+                xt_sub1_bar = x1_bar
+                if t - 1 != 0:
+                    step2 = torch.full((batch_size,), t - 2, dtype=torch.long, device=device)
+                    xt_sub1_bar = self.q_sample(x_start=xt_sub1_bar, x_end=x2_bar, t=step2)
+                x = img - xt_bar + xt_sub1_bar
+                img = x
+                t = t - 1
         else:
             x_target = xs[0]
-            pool = [next(interference_dl).cuda() for _ in range(t)]
-            for step_val in range(t, 0, -1):
-                step = torch.full((batch_size,), step_val - 1, dtype=torch.long, device=x_target.device)
-                k_val = min(1 + (step_val - 1), 1 + len(pool))
-                xs_step = [x_target] + pool[:max(0, k_val - 1)]
-                x_mix = self.q_sample_sum(xs=xs_step, t=step)
-                x1_bar = self.denoise_fn(x_mix, step)
+            device = x_target.device
+            pool = [next(interference_dl).cuda() for _ in range(total_steps + 1)]
+            xs_forward = [x_target] + pool
+            step_t = torch.full((batch_size,), total_steps - 1, dtype=torch.long, device=device)
+            x_end = self.q_sample_sum(xs=xs_forward, t=step_t)
+            img = self.q_sample(x_start=x_target, x_end=x_end, t=step_t)
+            t = total_steps
+            while t:
+                step = torch.full((batch_size,), t - 1, dtype=torch.long, device=device)
+                x1_bar = self.denoise_fn(img, step)
+                x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
                 X1_0s.append(x1_bar.detach().cpu())
-                X_ts.append(x_mix.detach().cpu())
+                X_ts.append(img.detach().cpu())
+                xt_bar = x1_bar
+                if t != 0:
+                    xt_bar = self.q_sample(x_start=xt_bar, x_end=x2_bar, t=step)
+                xt_sub1_bar = x1_bar
+                if t - 1 != 0:
+                    step2 = torch.full((batch_size,), t - 2, dtype=torch.long, device=device)
+                    xt_sub1_bar = self.q_sample(x_start=xt_sub1_bar, x_end=x2_bar, t=step2)
+                x = img - xt_bar + xt_sub1_bar
+                img = x
+                t = t - 1
         return X1_0s, X_ts
 
 class Dataset_Aug(data.Dataset):
