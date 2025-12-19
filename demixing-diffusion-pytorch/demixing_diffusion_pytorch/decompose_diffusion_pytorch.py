@@ -1,5 +1,3 @@
-import math
-import copy
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -7,301 +5,217 @@ from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms, utils
-from PIL import Image
+import numpy as np
+import copy
 from functools import partial
-from inspect import isfunction
-from einops import rearrange
-from tqdm import tqdm
-from Fid.fid_score import calculate_fid_given_samples
-import errno
+import wandb
 import os
-def exists(x):
-    return x is not None
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
+from .demixing_diffusion_pytorch import exists, default, cycle, EMA, Dataset, loss_backwards
 
-def cycle(dl):
-    while True:
-        for data in dl:
-            yield data
-
-def num_to_groups(num, divisor):
-    groups = num // divisor
-    remainder = num % divisor
-    arr = [divisor] * groups
-    if remainder > 0:
-        arr.append(remainder)
-    return arr
-
-def cosine_beta_schedule(timesteps, s=0.008):
-    steps = timesteps + 1
-    x = torch.linspace(0, steps, steps)
-    alphas_cumprod = torch.cos(((x / steps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0, 0.999)
-
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-def create_folder(path):
-    try:
-        os.mkdir(path)
-    except OSError as exc:
-        if exc.errno != errno.EEXIST:
-            raise
-        pass
-
-class EMA():
-    def __init__(self, beta):
-        super().__init__()
-        self.beta = beta
-    def update_model_average(self, ma_model, current_model):
-        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-            old_weight, up_weight = ma_params.data, current_params.data
-            ma_params.data = self.update_average(old_weight, up_weight)
-    def update_average(self, old, new):
-        if old is None:
-            return new
-        return old * self.beta + (1 - self.beta) * new
-
-class DecomposeDiffusion(nn.Module):
+class SICDiffusion(nn.Module):
     def __init__(
         self,
         denoise_fn,
         *,
         image_size,
-        channels=3,
-        timesteps=1000,
-        loss_type='l1',
-        num_sources=4
+        channels = 3,
+        k_steps = 5, # Total number of sources (K)
+        loss_type = 'l1'
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
         self.denoise_fn = denoise_fn
-        self.num_timesteps = int(timesteps)
+        self.k_steps = k_steps
         self.loss_type = loss_type
-        self.num_sources = int(num_sources)
-        betas = cosine_beta_schedule(timesteps)
-        alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, axis=0)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
 
-    def k_of_t(self, t):
-        k = 1 + torch.floor((self.num_sources - 1) * (t.float() + 1) / self.num_timesteps).long()
-        return torch.clamp(k, min=1, max=self.num_sources)
+    def q_sample(self, x_seq, alphas, t):
+        """
+        Forward process: Superimposing images.
+        
+        x_seq: (B, K, C, H, W) - Sequence of images sorted by strength. x_seq[:, 0] is the target.
+        alphas: (B, K) - Weights for each image.
+        t: (B,) - Current time step (0 to K-1). Indicates how many interference layers to add.
+        
+        Returns y^{(t)} = x^{(1)} + sum_{i=2}^{t+1} alpha_i x^{(i)}
+        """
+        B, K, C, H, W = x_seq.shape
+        device = x_seq.device
+        
+        # y^{(0)} = x^{(1)}
+        y = x_seq[:, 0].clone()
+        
+        # We need to add interference terms.
+        # x^{(i)} corresponds to x_seq[:, i-1] in 0-indexing.
+        # summation is for i from 2 to t+1.
+        # in 0-indexing, indices from 1 to t.
+        
+        # Create mask for indices 1 to K-1
+        j_indices = torch.arange(1, K, device=device) # [1, 2, ..., K-1]
+        
+        # Mask: we include index j if j <= t
+        # shape (1, K-1) broadcast to (B, K-1)
+        mask = j_indices[None, :] <= t[:, None]
+        
+        x_interferences = x_seq[:, 1:] # (B, K-1, C, H, W)
+        alpha_interferences = alphas[:, 1:] # (B, K-1)
+        
+        weighted_interferences = x_interferences * alpha_interferences[:, :, None, None, None]
+        
+        # Zero out terms that shouldn't be included
+        masked_interferences = weighted_interferences * mask[:, :, None, None, None].float()
+        
+        # Sum over the K dimension
+        total_interference = masked_interferences.sum(dim=1)
+        
+        return y + total_interference
 
-    def normalize_sum(self, x_sum, k):
-        k_clamped = torch.clamp(k, min=1)
-        k_view = k_clamped.view(-1, 1, 1, 1).type_as(x_sum)
-        out = x_sum / k_view
-        return torch.clamp(out, -1.0, 1.0)
-
-    def q_sample_sum(self, xs, t):
-        if len(xs) < 2:
-            return torch.clamp(xs[0], -1.0, 1.0)
-        x_sum = torch.zeros_like(xs[1])
-        for i in range(1, len(xs)):
-            x_sum = x_sum + xs[i]
-        k = torch.full((xs[0].shape[0],), max(1, len(xs) - 1), dtype=torch.long, device=xs[0].device)
-        noise = self.normalize_sum(x_sum, k)
-        return noise
-
-    def q_sample(self, x_start, x_end, t):
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_end
-        )
-
-    def get_x2_bar_from_xt(self, x1_bar, xt, t):
-        return (
-            (xt - extract(self.sqrt_alphas_cumprod, t, x1_bar.shape) * x1_bar) /
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x1_bar.shape)
-        )
-
-    def p_losses(self, xs, t):
-        x_start = xs[0]
-        x_end = self.q_sample_sum(xs=xs, t=t)
-        x_mix = self.q_sample(x_start=x_start, x_end=x_end, t=t)
-        x_recon = self.denoise_fn(x_mix, t)
+    def p_losses(self, x_seq, alphas, t):
+        """
+        Compute loss for predicting the top interference layer.
+        
+        t ranges from 1 to K-1.
+        We predict x^{(t+1)} given y^{(t)}.
+        """
+        # Target is x^{(t+1)}, which is x_seq[:, t]
+        target = x_seq[torch.arange(x_seq.shape[0]), t] # (B, C, H, W)
+        
+        # Input is y^{(t)}
+        y_t = self.q_sample(x_seq, alphas, t)
+        
+        # Conditioning: alpha_{t+1} corresponds to alphas[:, t]
+        alpha_cond = alphas[torch.arange(alphas.shape[0]), t]
+        
+        # Prepare input for denoise_fn
+        # We append alpha as an extra channel
+        b, c, h, w = y_t.shape
+        alpha_map = alpha_cond[:, None, None, None].expand(b, 1, h, w)
+        model_input = torch.cat((y_t, alpha_map), dim=1)
+        
+        # Predict
+        prediction = self.denoise_fn(model_input, t)
+        
         if self.loss_type == 'l1':
-            loss = (x_start - x_recon).abs().mean()
+            loss = (target - prediction).abs().mean()
         elif self.loss_type == 'l2':
-            loss = F.mse_loss(x_start, x_recon)
+            loss = F.mse_loss(target, prediction)
         else:
             raise NotImplementedError()
+            
         return loss
 
-    def forward(self, xs, *args, **kwargs):
-        b, c, h, w, device, img_size = *xs[0].shape, xs[0].device, self.image_size
-        assert h == img_size and w == img_size
-        t_kw = kwargs.pop('t', None)
-        t = t_kw if t_kw is not None else torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(xs, t)
+    def forward(self, x_seq, alphas):
+        """
+        x_seq: (B, K, C, H, W)
+        alphas: (B, K)
+        """
+        b = x_seq.shape[0]
+        device = x_seq.device
+        
+        # Sample t from 1 to K-1
+        # t=0 is not trained on because we don't predict anything from y^{(0)} in the reverse loop 
+        # (reverse loop stops at getting y^{(0)})
+        
+        if self.k_steps <= 1:
+            return torch.tensor(0., device=device, requires_grad=True)
+            
+        t = torch.randint(1, self.k_steps, (b,), device=device).long()
+        
+        return self.p_losses(x_seq, alphas, t)
 
     @torch.no_grad()
-    def all_sample(self, batch_size=16, xs=None, times=None, interference_dl=None):
-        self.denoise_fn.eval()
-        total_steps = self.num_timesteps if times is None else int(times)
-        X1_0s, X_ts = [], []
-        if interference_dl is None:
-            if xs is None or len(xs) == 0:
-                raise ValueError("xs must be provided when interference_dl is None.")
-            device = xs[0].device
-            step_t = torch.full((batch_size,), total_steps - 1, dtype=torch.long, device=device)
-            x_end = self.q_sample_sum(xs=xs, t=step_t)
-            img = self.q_sample(x_start=xs[0], x_end=x_end, t=step_t)
-            t = total_steps
-            while t:
-                step = torch.full((batch_size,), t - 1, dtype=torch.long, device=device)
-                x1_bar = self.denoise_fn(img, step)
-                x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
-                X1_0s.append(x1_bar.detach().cpu())
-                X_ts.append(img.detach().cpu())
-                xt_bar = x1_bar
-                if t != 0:
-                    xt_bar = self.q_sample(x_start=xt_bar, x_end=x2_bar, t=step)
-                xt_sub1_bar = x1_bar
-                if t - 1 != 0:
-                    step2 = torch.full((batch_size,), t - 2, dtype=torch.long, device=device)
-                    xt_sub1_bar = self.q_sample(x_start=xt_sub1_bar, x_end=x2_bar, t=step2)
-                x = img - xt_bar + xt_sub1_bar
-                img = x
-                t = t - 1
-        else:
-            x_target = xs[0]
-            device = x_target.device
-            pool = [next(interference_dl).cuda() for _ in range(total_steps + 1)]
-            xs_forward = [x_target] + pool
-            step_t = torch.full((batch_size,), total_steps - 1, dtype=torch.long, device=device)
-            x_end = self.q_sample_sum(xs=xs_forward, t=step_t)
-            img = self.q_sample(x_start=x_target, x_end=x_end, t=step_t)
-            t = total_steps
-            while t:
-                step = torch.full((batch_size,), t - 1, dtype=torch.long, device=device)
-                x1_bar = self.denoise_fn(img, step)
-                x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
-                X1_0s.append(x1_bar.detach().cpu())
-                X_ts.append(img.detach().cpu())
-                xt_bar = x1_bar
-                if t != 0:
-                    xt_bar = self.q_sample(x_start=xt_bar, x_end=x2_bar, t=step)
-                xt_sub1_bar = x1_bar
-                if t - 1 != 0:
-                    step2 = torch.full((batch_size,), t - 2, dtype=torch.long, device=device)
-                    xt_sub1_bar = self.q_sample(x_start=xt_sub1_bar, x_end=x2_bar, t=step2)
-                x = img - xt_bar + xt_sub1_bar
-                img = x
-                t = t - 1
-        return X1_0s, X_ts
+    def sample(self, y_final, alphas):
+        """
+        Perform SIC to recover the clean signal.
+        
+        y_final: (B, C, H, W) - The observation y^{(K-1)}
+        alphas: (B, K) - Known weights
+        """
+        y = y_final
+        b, c, h, w = y.shape
+        device = y.device
+        
+        # Iteratively remove interference
+        # From t = K-1 down to 1
+        for t_val in reversed(range(1, self.k_steps)):
+            t = torch.full((b,), t_val, device=device, dtype=torch.long)
+            
+            # alpha_{t+1} is alphas[:, t_val]
+            alpha_cond = alphas[:, t_val]
+            
+            # Input
+            alpha_map = alpha_cond[:, None, None, None].expand(b, 1, h, w)
+            model_input = torch.cat((y, alpha_map), dim=1)
+            
+            # Predict interference x^{(t+1)}
+            x_pred = self.denoise_fn(model_input, t)
+            
+            # Remove interference
+            # y^{(t-1)} = y^{(t)} - alpha_{t+1} * x^{(t+1)}
+            y = y - alpha_cond[:, None, None, None] * x_pred
+            
+        return y
 
-class Dataset_Aug(data.Dataset):
-    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png']):
-        super().__init__()
-        self.folder = folder
-        self.image_size = image_size
-        allowed_exts = set(['.' + e.lower() for e in exts])
-        self.paths = [p for p in Path(folder).rglob('*') if p.is_file() and p.suffix.lower() in allowed_exts]
-        self.transform = transforms.Compose([
-            transforms.Resize((int(image_size * 1.12), int(image_size * 1.12))),
-            transforms.RandomCrop(image_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda t: (t * 2) - 1)
-        ])
-    def __len__(self):
-        return len(self.paths)
-    def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        img = img.convert('RGB')
-        return self.transform(img)
-
-class Dataset_Center(data.Dataset):
-    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png']):
-        super().__init__()
-        self.folder = folder
-        self.image_size = image_size
-        allowed_exts = set(['.' + e.lower() for e in exts])
-        self.paths = [p for p in Path(folder).rglob('*') if p.is_file() and p.suffix.lower() in allowed_exts]
-        self.transform = transforms.Compose([
-            transforms.Resize((int(image_size * 1.12), int(image_size * 1.12))),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda t: (t * 2) - 1)
-        ])
-    def __len__(self):
-        return len(self.paths)
-    def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        img = img.convert('RGB')
-        return self.transform(img)
-
-class DecomposeTrainer(object):
+class SICTrainer(object):
     def __init__(
         self,
         diffusion_model,
-        folders,
+        folder,
         *,
-        ema_decay=0.995,
-        image_size=128,
-        train_batch_size=32,
-        train_lr=2e-5,
-        train_num_steps=100000,
-        gradient_accumulate_every=2,
-        fp16=False,
-        step_start_ema=2000,
-        update_ema_every=10,
-        save_and_sample_every=1000,
-        results_folder='./results_decompose',
-        dataset='train',
-        shuffle=True,
-        use_wandb=False,
-        wandb_project='DecomposeDiffusion',
-        wandb_run_name=None
+        train_batch_size = 32,
+        train_lr = 2e-5,
+        train_num_steps = 100000,
+        gradient_accumulate_every = 2,
+        ema_decay = 0.995,
+        fp16 = False,
+        step_start_ema = 2000,
+        update_ema_every = 10,
+        save_and_sample_every = 1000,
+        results_folder = './results',
+        load_path = None,
+        shuffle = True,
+        image_size = 128,
+        wandb_project = 'SIC_Diffusion',
+        wandb_run_name = None
     ):
         super().__init__()
         self.model = diffusion_model
+        self.k_steps = diffusion_model.k_steps
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
+        
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
+        
         self.batch_size = train_batch_size
         self.image_size = image_size
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
-        self.fp16 = fp16
-        self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok=True)
-        self.use_wandb = use_wandb
-        self.wandb_project = wandb_project
-        self.wandb_run_name = wandb_run_name
-        self.wandb_run = None
-        if dataset == 'train':
-            ds_cls = Dataset_Aug
-        else:
-            ds_cls = Dataset_Center
-        self.datasets = [ds_cls(folder, image_size) for folder in folders]
-        if len(self.datasets) != 2:
-            raise ValueError('Require exactly two data_paths: target first, interference second.')
-        for ds, folder in zip(self.datasets, folders):
-            if len(ds) == 0:
-                raise ValueError(f'No images found in folder "{folder}" with supported extensions.')
-        self.dataloaders = [cycle(data.DataLoader(ds, batch_size=train_batch_size, shuffle=shuffle, pin_memory=True, num_workers=8, drop_last=True)) for ds in self.datasets]
-        self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
+        
+        self.ds = Dataset(folder, image_size)
+        # We need to fetch enough images to form batches of size (B, K)
+        # The dataloader will return flat batches, we will reshape them in training loop
+        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size * self.k_steps, shuffle = shuffle, pin_memory = True, num_workers = 4, drop_last = True))
+        
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr)
         self.step = 0
+        
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok = True)
+        
+        self.fp16 = fp16
+        
         self.reset_parameters()
-        self.fid_eval_every = save_and_sample_every
+        
+        if load_path != None:
+            self.load(load_path)
+            
+        if wandb_run_name:
+            wandb.init(project=wandb_project, name=wandb_run_name)
+        else:
+            wandb.init(project=wandb_project)
 
     def reset_parameters(self):
         self.ema_model.load_state_dict(self.model.state_dict())
@@ -323,156 +237,124 @@ class DecomposeTrainer(object):
         else:
             torch.save(data, str(self.results_folder / f'model_{itrs}.pt'))
 
+    def load(self, load_path):
+        print("Loading : ", load_path)
+        data = torch.load(load_path)
+
+        self.step = data['step']
+        self.model.load_state_dict(data['model'])
+        self.ema_model.load_state_dict(data['ema'])
+
+    def prepare_batch(self, batch):
+        # batch: (B*K, C, H, W)
+        device = batch.device
+        B = self.batch_size
+        K = self.k_steps
+        C, H, W = batch.shape[1:]
+        
+        # Reshape to (B, K, C, H, W)
+        x_seq_raw = batch.view(B, K, C, H, W)
+        
+        # Designate index 0 as target x^{(1)}
+        targets = x_seq_raw[:, 0] # (B, C, H, W)
+        interferences = x_seq_raw[:, 1:] # (B, K-1, C, H, W)
+        
+        # Generate random weights for interferences
+        # alpha_i in (0, 1]
+        alpha_interferences = torch.rand((B, K-1), device=device) * 0.9 + 0.1 # Avoid too small weights? Or just rand
+        
+        # Calculate weighted strength
+        weighted_interferences = interferences * alpha_interferences[:, :, None, None, None]
+        norms = weighted_interferences.flatten(2).norm(dim=2) # (B, K-1)
+        
+        # Sort interferences by strength descending
+        sorted_indices = torch.argsort(norms, dim=1, descending=True) # (B, K-1)
+        
+        # Gather sorted alphas
+        sorted_alpha_interferences = torch.gather(alpha_interferences, 1, sorted_indices)
+        
+        # Gather sorted interferences
+        # Need to expand indices for gather
+        # sorted_indices shape (B, K-1) -> (B, K-1, C, H, W)
+        sorted_indices_expanded = sorted_indices[:, :, None, None, None].expand(-1, -1, C, H, W)
+        sorted_interferences = torch.gather(interferences, 1, sorted_indices_expanded)
+        
+        # Construct final x_seq and alphas
+        # x_seq: concat target and sorted interferences
+        x_seq = torch.cat((targets.unsqueeze(1), sorted_interferences), dim=1)
+        
+        # alphas: concat 1.0 and sorted alpha_interferences
+        ones = torch.ones((B, 1), device=device)
+        alphas = torch.cat((ones, sorted_alpha_interferences), dim=1)
+        
+        return x_seq, alphas
+
     def train(self):
-        backwards = lambda loss: loss.backward()
+        backwards = partial(loss_backwards, self.fp16)
+
         acc_loss = 0
-        if self.use_wandb and self.wandb_run is None:
-            import wandb
-            self.wandb_run = wandb.init(project=self.wandb_project, name=self.wandb_run_name)
         while self.step < self.train_num_steps:
             u_loss = 0
-            for _ in range(self.gradient_accumulate_every):
-                x_target = next(self.dataloaders[0]).cuda()
-                _model = self.model.module if hasattr(self.model, 'module') else self.model
-                s = int(torch.randint(1, _model.num_timesteps + 1, (1,), device=x_target.device).item())
-                xs_list = [x_target] + [next(self.dataloaders[1]).cuda() for _ in range(s)]
-                step = torch.full((x_target.shape[0],), s - 1, dtype=torch.long, device=x_target.device)
-                loss = torch.mean(self.model(xs_list, t=step))
+            for i in range(self.gradient_accumulate_every):
+                data = next(self.dl).cuda()
+                x_seq, alphas = self.prepare_batch(data)
+                
+                loss = self.model(x_seq, alphas)
+                
+                if self.step % 100 == 0:
+                    print(f'{self.step}: {loss.item()}')
+                    wandb.log({"loss": loss.item()}, step=self.step)
+                    
                 u_loss += loss.item()
-                backwards(loss / self.gradient_accumulate_every)
-            acc_loss = acc_loss + (u_loss / self.gradient_accumulate_every)
+                backwards(loss / self.gradient_accumulate_every, self.opt)
+
+            acc_loss = acc_loss + (u_loss/self.gradient_accumulate_every)
+
             self.opt.step()
             self.opt.zero_grad()
-            if self.use_wandb and self.wandb_run is not None:
-                import wandb
-                wandb.log({"train_loss": u_loss / self.gradient_accumulate_every, "step": self.step})
+
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
-            if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                milestone = self.step // self.save_and_sample_every
-                batches = self.batch_size
-                with torch.no_grad():
-                    x_target = next(self.dataloaders[0]).cuda()
-                    _ema = self.ema_model.module if hasattr(self.ema_model, 'module') else self.ema_model
-                    x1_0s, x_ts = _ema.all_sample(batch_size=batches, xs=[x_target], interference_dl=self.dataloaders[1])
-                    og_imgs = x_target
-                    og_imgs = (og_imgs + 1) * 0.5
-                    utils.save_image(og_imgs, str(self.results_folder / f'sample-og-{milestone}.png'), nrow=6)
-                    recons = (x1_0s[-1] + 1) * 0.5
-                    utils.save_image(recons, str(self.results_folder / f'sample-recon-{milestone}.png'), nrow=6)
-                    xt0 = (x_ts[-1] + 1) * 0.5
-                    utils.save_image(xt0, str(self.results_folder / f'sample-xt0-{milestone}.png'), nrow=6)
-                    noise_last = torch.clamp(x_ts[-1] - x1_0s[-1], -1, 1)
-                    utils.save_image((noise_last + 1) * 0.5, str(self.results_folder / f'sample-noise-{milestone}.png'), nrow=6)
-                    import imageio
-                    fwd_frames = []
-                    rev_frames = []
-                    noise_frames = []
-                    X_ts_forward = list(reversed(x_ts))
-                    for i in range(len(X_ts_forward)):
-                        xt_f = (X_ts_forward[i] + 1) * 0.5
-                        utils.save_image(xt_f, str(self.results_folder / f'fwd-{milestone}-{i}.png'), nrow=6)
-                        fwd_frames.append(imageio.imread(str(self.results_folder / f'fwd-{milestone}-{i}.png')))
-                    for i in range(len(x1_0s)):
-                        x0_r = (x1_0s[i] + 1) * 0.5
-                        utils.save_image(x0_r, str(self.results_folder / f'rev-{milestone}-{i}.png'), nrow=6)
-                        rev_frames.append(imageio.imread(str(self.results_folder / f'rev-{milestone}-{i}.png')))
-                        noise_i = torch.clamp(x_ts[i] - x1_0s[i], -1, 1)
-                        noise_i_v = (noise_i + 1) * 0.5
-                        utils.save_image(noise_i_v, str(self.results_folder / f'noise-{milestone}-{i}.png'), nrow=6)
-                        noise_frames.append(imageio.imread(str(self.results_folder / f'noise-{milestone}-{i}.png')))
-                    imageio.mimsave(str(self.results_folder / f'Gif-forward-{milestone}.gif'), fwd_frames)
-                    imageio.mimsave(str(self.results_folder / f'Gif-reverse-{milestone}.gif'), rev_frames)
-                    imageio.mimsave(str(self.results_folder / f'Gif-noise-{milestone}.gif'), noise_frames)
-                    if self.use_wandb and self.wandb_run is not None:
-                        import wandb
-                        from torchvision.utils import make_grid
-                        wandb.log({
-                            "og": wandb.Image(make_grid(og_imgs, nrow=6)),
-                            "recon": wandb.Image(make_grid(recons, nrow=6)),
-                            "xt0": wandb.Image(make_grid(xt0, nrow=6)),
-                            "fwd_first": wandb.Image(make_grid((X_ts_forward[0] + 1) * 0.5, nrow=6)),
-                            "fwd_mid": wandb.Image(make_grid((X_ts_forward[len(X_ts_forward) // 2] + 1) * 0.5, nrow=6)),
-                            "fwd_last": wandb.Image(make_grid((X_ts_forward[-1] + 1) * 0.5, nrow=6)),
-                            "rev_first": wandb.Image(make_grid((x1_0s[0] + 1) * 0.5, nrow=6)),
-                            "rev_mid": wandb.Image(make_grid((x1_0s[len(x1_0s) // 2] + 1) * 0.5, nrow=6)),
-                            "rev_last": wandb.Image(make_grid((x1_0s[-1] + 1) * 0.5, nrow=6)),
-                            "noise_first": wandb.Image(make_grid(((torch.clamp(x_ts[0] - x1_0s[0], -1, 1) + 1) * 0.5), nrow=6)),
-                            "noise_mid": wandb.Image(make_grid(((torch.clamp(x_ts[len(x_ts) // 2] - x1_0s[len(x1_0s) // 2], -1, 1) + 1) * 0.5), nrow=6)),
-                            "noise_last": wandb.Image(make_grid(((torch.clamp(x_ts[-1] - x1_0s[-1], -1, 1) + 1) * 0.5), nrow=6)),
-                            "milestone": milestone,
-                            "step": self.step
-                        })
-                    # FID evaluation (original vs reconstructed)
-                    try:
-                        fid_value = calculate_fid_given_samples(
-                            samples=[og_imgs.cpu(), ((x1_0s[-1] + 1) * 0.5).cpu()],
-                            batch_size=min(50, og_imgs.shape[0]),
-                            device='cuda:0' if torch.cuda.is_available() else 'cpu',
-                            dims=2048,
-                            num_workers=1
-                        )
-                        if self.use_wandb and self.wandb_run is not None:
-                            import wandb
-                            wandb.log({"fid_recon_vs_real": float(fid_value), "step": self.step})
-                    except Exception as e:
-                        pass
-                self.save()
-            self.step += 1
-        if self.use_wandb and self.wandb_run is not None:
-            import wandb
-            wandb.finish()
 
-    @torch.no_grad()
-    def test_from_data(self, extra_path, s_times=None):
-        batches = self.batch_size
-        x_target = next(self.dataloaders[0]).cuda()
-        _ema = self.ema_model.module if hasattr(self.ema_model, 'module') else self.ema_model
-        X_0s, X_ts = _ema.all_sample(batch_size=batches, xs=[x_target], times=s_times, interference_dl=self.dataloaders[1])
-        og_img = (x_target + 1) * 0.5
-        utils.save_image(og_img, str(self.results_folder / f'og-{extra_path}.png'), nrow=6)
-        import imageio
-        frames_t = []
-        frames_0 = []
-        frames_n = []
-        for i in range(len(X_0s)):
-            x_0 = X_0s[i]
-            x_0 = (x_0 + 1) * 0.5
-            utils.save_image(x_0, str(self.results_folder / f'sample-{i}-{extra_path}-x0.png'), nrow=6)
-            frames_0.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-x0.png')))
-            x_t = X_ts[i]
-            all_images = (x_t + 1) * 0.5
-            utils.save_image(all_images, str(self.results_folder / f'sample-{i}-{extra_path}-xt.png'), nrow=6)
-            frames_t.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-xt.png')))
-            noise_i = torch.clamp(x_t - X_0s[i], -1, 1)
-            noise_i_v = (noise_i + 1) * 0.5
-            utils.save_image(noise_i_v, str(self.results_folder / f'sample-{i}-{extra_path}-noise.png'), nrow=6)
-            frames_n.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-noise.png')))
-        imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-x0.gif'), frames_0)
-        imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-xt.gif'), frames_t)
-        imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-noise.gif'), frames_n)
-        if self.use_wandb and self.wandb_run is None:
-            import wandb
-            self.wandb_run = wandb.init(project=self.wandb_project, name=self.wandb_run_name)
-        if self.use_wandb and self.wandb_run is not None:
-            import wandb
-            from torchvision.utils import make_grid
-            wandb.log({
-                "test_og": wandb.Image(make_grid(og_img, nrow=6)),
-                "test_x0_last": wandb.Image(make_grid((X_0s[-1] + 1) * 0.5, nrow=6)),
-                "test_xt_last": wandb.Image(make_grid((X_ts[-1] + 1) * 0.5, nrow=6)),
-                "test_noise_last": wandb.Image(make_grid(((torch.clamp(X_ts[-1] - X_0s[-1], -1, 1) + 1) * 0.5), nrow=6))
-            })
-        try:
-            fid_value = calculate_fid_given_samples(
-                samples=[og_img.cpu(), ((X_0s[-1] + 1) * 0.5).cpu()],
-                batch_size=min(50, og_img.shape[0]),
-                device='cuda:0' if torch.cuda.is_available() else 'cpu',
-                dims=2048,
-                num_workers=1
-            )
-            if self.use_wandb and self.wandb_run is not None:
-                import wandb
-                wandb.log({"fid_recon_vs_real_test": float(fid_value)})
-        except Exception:
-            pass
+            if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                # Validation / Sampling
+                self.ema_model.eval()
+                with torch.no_grad():
+                    # Get a fresh batch
+                    val_data = next(self.dl).cuda()
+                    x_seq_val, alphas_val = self.prepare_batch(val_data)
+                    
+                    # Construct full superposition y^{(K-1)}
+                    # t = K-1
+                    t_full = torch.full((self.batch_size,), self.k_steps - 1, device=x_seq_val.device, dtype=torch.long)
+                    y_full = self.ema_model.module.q_sample(x_seq_val, alphas_val, t_full) # Use module for DataParallel
+                    
+                    # Reconstruct
+                    reconstructed = self.ema_model.module.sample(y_full, alphas_val)
+                    
+                    target = x_seq_val[:, 0]
+                    
+                    # Prepare images for wandb
+                    # Unnormalize from [-1, 1] to [0, 1]
+                    target_vis = (target + 1) * 0.5
+                    y_full_vis = (y_full + 1) * 0.5
+                    reconstructed_vis = (reconstructed + 1) * 0.5
+                    
+                    # Grid
+                    grid_target = utils.make_grid(target_vis, nrow=4)
+                    grid_input = utils.make_grid(y_full_vis, nrow=4)
+                    grid_recon = utils.make_grid(reconstructed_vis, nrow=4)
+                    
+                    wandb.log({
+                        "Target (Clean)": wandb.Image(grid_target),
+                        "Input (Superimposed)": wandb.Image(grid_input),
+                        "Reconstructed": wandb.Image(grid_recon)
+                    }, step=self.step)
+                
+                self.save()
+                self.ema_model.train()
+
+            self.step += 1
+
+        print('training completed')
+        wandb.finish()
