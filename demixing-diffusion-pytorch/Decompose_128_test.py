@@ -5,7 +5,7 @@ from PIL import Image
 import torch
 from torchvision import transforms, utils
 from demixing_diffusion_pytorch import Unet, DecomposeDiffusion
-import imageio
+import imageio.v2 as imageio
 
 def build_transform(image_size):
     return transforms.Compose([
@@ -30,7 +30,7 @@ def load_images(folder, image_size, device):
     return xs
 
 def load_weights(diffusion, weights_path, device):
-    data = torch.load(weights_path, map_location=device)
+    data = torch.load(weights_path, map_location=device, weights_only=True)
     state = data['ema'] if isinstance(data, dict) and 'ema' in data else (data['model'] if isinstance(data, dict) and 'model' in data else data)
     try:
         diffusion.load_state_dict(state)
