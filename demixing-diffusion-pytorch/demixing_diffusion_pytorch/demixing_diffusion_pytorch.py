@@ -712,8 +712,7 @@ class Trainer(object):
 
 
     def train(self):
-        experiment = Experiment(api_key="57ArytWuo2X4cdDmgU1jxin77",
-                                project_name="Cold_Diffusion_Cycle")
+        experiment = Experiment(project_name="Cold_Diffusion_Cycle")
 
         backwards = partial(loss_backwards, self.fp16)
 
