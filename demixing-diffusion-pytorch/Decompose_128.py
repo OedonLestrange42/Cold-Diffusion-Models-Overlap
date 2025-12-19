@@ -4,7 +4,7 @@ import torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--time_steps', default=50, type=int)
-parser.add_argument('--train_steps', default=700000, type=int)
+parser.add_argument('--train_steps', default=70000, type=int)
 parser.add_argument('--save_folder', default='./results_decompose', type=str)
 parser.add_argument('--data_paths', nargs='+', required=True, type=str)
 parser.add_argument('--load_path', default=None, type=str)

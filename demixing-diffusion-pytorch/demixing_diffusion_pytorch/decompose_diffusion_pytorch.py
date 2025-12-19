@@ -447,7 +447,7 @@ class DecomposeTrainer(object):
             noise_i = torch.clamp(x_t - X_0s[i], -1, 1)
             noise_i_v = (noise_i + 1) * 0.5
             utils.save_image(noise_i_v, str(self.results_folder / f'sample-{i}-{extra_path}-noise.png'), nrow=6)
-            frames_n.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-noise.png")))
+            frames_n.append(imageio.imread(str(self.results_folder / f'sample-{i}-{extra_path}-noise.png')))
         imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-x0.gif'), frames_0)
         imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-xt.gif'), frames_t)
         imageio.mimsave(str(self.results_folder / f'Gif-{extra_path}-noise.gif'), frames_n)
