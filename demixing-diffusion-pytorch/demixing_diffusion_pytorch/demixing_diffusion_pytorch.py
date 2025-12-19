@@ -1,4 +1,4 @@
-import wandb
+from comet_ml import Experiment
 import math
 import copy
 import torch
@@ -712,16 +712,8 @@ class Trainer(object):
 
 
     def train(self):
-        wandb.init(project="Cold_Diffusion_Cycle")
-        wandb.config.update({
-            "image_size": self.image_size,
-            "train_batch_size": self.batch_size,
-            "train_lr": self.opt.param_groups[0]["lr"],
-            "train_num_steps": self.train_num_steps,
-            "gradient_accumulate_every": self.gradient_accumulate_every,
-            "fp16": self.fp16
-        }, allow_val_change=True)
-        wandb.watch(self.model, log="gradients", log_freq=100)
+        experiment = Experiment(api_key="57ArytWuo2X4cdDmgU1jxin77",
+                                project_name="Cold_Diffusion_Cycle")
 
         backwards = partial(loss_backwards, self.fp16)
 
@@ -746,6 +738,7 @@ class Trainer(object):
                 self.step_ema()
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                experiment.log_current_epoch(self.step)
                 milestone = self.step // self.save_and_sample_every
                 batches = self.batch_size
                 og_img = next(self.dl2).cuda()
@@ -765,41 +758,8 @@ class Trainer(object):
                 utils.save_image(xt, str(self.results_folder / f'sample-xt-{milestone}.png'),
                                  nrow=6)
 
-                grid_og = utils.make_grid(og_img, nrow=6)
-                grid_recon = utils.make_grid(all_images, nrow=6)
-                grid_direct = utils.make_grid(direct_recons, nrow=6)
-                grid_xt = utils.make_grid(xt, nrow=6)
-                wandb.log({
-                    "images/og": wandb.Image(grid_og),
-                    "images/recon": wandb.Image(grid_recon),
-                    "images/direct_recons": wandb.Image(grid_direct),
-                    "images/xt": wandb.Image(grid_xt)
-                }, step=self.step)
-
-                X_0s, X_ts = self.ema_model.module.all_sample(batch_size=batches, img=og_img)
-                import imageio
-                frames_0 = []
-                frames_t = []
-                for i in range(len(X_0s)):
-                    x0 = (X_0s[i] + 1) * 0.5
-                    xt_seq = (X_ts[i] + 1) * 0.5
-                    grid_x0 = utils.make_grid(x0, nrow=6).permute(1, 2, 0).cpu().numpy()
-                    grid_xt_seq = utils.make_grid(xt_seq, nrow=6).permute(1, 2, 0).cpu().numpy()
-                    grid_x0 = (grid_x0 * 255).clip(0, 255).astype("uint8")
-                    grid_xt_seq = (grid_xt_seq * 255).clip(0, 255).astype("uint8")
-                    frames_0.append(grid_x0)
-                    frames_t.append(grid_xt_seq)
-                gif_x0_path = str(self.results_folder / f'Gif-{milestone}-x0.gif')
-                gif_xt_path = str(self.results_folder / f'Gif-{milestone}-xt.gif')
-                imageio.mimsave(gif_x0_path, frames_0)
-                imageio.mimsave(gif_xt_path, frames_t)
-                wandb.log({
-                    "gif/x0": wandb.Video(gif_x0_path, format="gif"),
-                    "gif/xt": wandb.Video(gif_xt_path, format="gif")
-                }, step=self.step)
-
                 acc_loss = acc_loss/(self.save_and_sample_every+1)
-                wandb.log({"train/loss_mean": acc_loss}, step=self.step)
+                experiment.log_metric("Training Loss", acc_loss, step=self.step)
                 print(f'Mean of last {self.step}: {acc_loss}')
                 acc_loss=0
 
@@ -810,7 +770,6 @@ class Trainer(object):
             self.step += 1
 
         print('training completed')
-        wandb.finish()
 
     def test_from_data(self, extra_path, s_times=None):
         batches = self.batch_size
