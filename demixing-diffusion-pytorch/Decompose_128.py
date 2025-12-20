@@ -1,5 +1,5 @@
 from demixing_diffusion_pytorch import Unet
-from demixing_diffusion_pytorch.decompose_diffusion_pytorch import SICDiffusion, SICTrainer
+from demixing_diffusion_pytorch import SICDiffusion, SICTrainer
 import argparse
 import torch
 
