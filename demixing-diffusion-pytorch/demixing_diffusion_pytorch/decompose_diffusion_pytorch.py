@@ -331,25 +331,19 @@ class SICTrainer(object):
         targets = x_seq_raw[:, 0] # (B, C, H, W)
         interferences = x_seq_raw[:, 1:] # (B, K-1, C, H, W)
         
-        # Generate random weights for interferences
-        # alpha_i in (0, 1]
-        alpha_interferences = torch.rand((B, K-1), device=device) * 0.9 + 0.1 # Avoid too small weights? Or just rand
-        
-        # Calculate weighted strength
-        weighted_interferences = interferences * alpha_interferences[:, :, None, None, None]
-        norms = weighted_interferences.flatten(2).norm(dim=2) # (B, K-1)
-        
-        # Sort interferences by strength descending
+        # Sort interferences by intrinsic strength (norm) descending
+        norms = interferences.flatten(2).norm(dim=2) # (B, K-1)
         sorted_indices = torch.argsort(norms, dim=1, descending=True) # (B, K-1)
         
-        # Gather sorted alphas
-        sorted_alpha_interferences = torch.gather(alpha_interferences, 1, sorted_indices)
-        
-        # Gather sorted interferences
-        # Need to expand indices for gather
-        # sorted_indices shape (B, K-1) -> (B, K-1, C, H, W)
         sorted_indices_expanded = sorted_indices[:, :, None, None, None].expand(-1, -1, C, H, W)
         sorted_interferences = torch.gather(interferences, 1, sorted_indices_expanded)
+
+        # Generate fixed weights for interferences using cosine schedule
+        t = torch.linspace(0, 1, K - 1, device=device)
+        alpha_fixed = torch.cos(t * np.pi / 2)
+        
+        # Expand to batch size
+        sorted_alpha_interferences = alpha_fixed.unsqueeze(0).expand(B, -1)
         
         # Construct final x_seq and alphas
         # x_seq: concat target and sorted interferences
