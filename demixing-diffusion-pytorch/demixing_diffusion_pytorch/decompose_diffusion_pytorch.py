@@ -248,7 +248,12 @@ class SICTrainer(object):
     ):
         super().__init__()
         self.model = diffusion_model
-        self.k_steps = diffusion_model.k_steps
+        # Handle DataParallel case for k_steps access
+        if isinstance(diffusion_model, nn.DataParallel):
+            self.k_steps = diffusion_model.module.k_steps
+        else:
+            self.k_steps = diffusion_model.k_steps
+            
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
@@ -394,10 +399,14 @@ class SICTrainer(object):
                     # Construct full superposition y^{(K-1)}
                     # t = K-1
                     t_full = torch.full((self.batch_size,), self.k_steps - 1, device=x_seq_val.device, dtype=torch.long)
-                    y_full = self.ema_model.module.q_sample(x_seq_val, alphas_val, t_full) # Use module for DataParallel
+                    
+                    # Access underlying model safely
+                    ema_model_inner = self.ema_model.module if isinstance(self.ema_model, nn.DataParallel) else self.ema_model
+                    
+                    y_full = ema_model_inner.q_sample(x_seq_val, alphas_val, t_full)
                     
                     # Reconstruct
-                    reconstructed = self.ema_model.module.sample(y_full, alphas_val)
+                    reconstructed = ema_model_inner.sample(y_full, alphas_val)
                     
                     target = x_seq_val[:, 0]
                     
