@@ -10,8 +10,75 @@ import copy
 from functools import partial
 import wandb
 import os
+from PIL import Image
+from inspect import isfunction
 
-from .demixing_diffusion_pytorch import exists, default, cycle, EMA, Dataset, loss_backwards
+try:
+    from apex import amp
+except:
+    pass
+
+# Helper functions and classes duplicated from demixing_diffusion_pytorch.py to avoid circular imports
+
+def exists(x):
+    return x is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+def loss_backwards(fp16, loss, optimizer, **kwargs):
+    if fp16:
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward(**kwargs)
+    else:
+        loss.backward(**kwargs)
+
+class EMA():
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def update_model_average(self, ma_model, current_model):
+        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+            old_weight, up_weight = ma_params.data, current_params.data
+            ma_params.data = self.update_average(old_weight, up_weight)
+
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+class Dataset(data.Dataset):
+    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png']):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [p for p in Path(folder).rglob('*') if p.is_file() and p.suffix.lower().lstrip('.') in exts]
+
+        self.transform = transforms.Compose([
+            transforms.Resize((int(image_size*1.12), int(image_size*1.12))),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda t: (t * 2) - 1)
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        img = img.convert('RGB')
+        return self.transform(img)
+
+# Main classes
 
 class SICDiffusion(nn.Module):
     def __init__(
