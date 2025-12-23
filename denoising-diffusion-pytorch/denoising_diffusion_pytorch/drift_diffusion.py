@@ -235,9 +235,9 @@ class DriftTrainer(Trainer):
         })
 
         # Setup Datasets
-        # We use Dataset_Aug1 for training as in the reference script
-        self.ds1 = Dataset_Aug1(folder1, image_size)
-        self.ds2 = Dataset_Aug1(folder2, image_size)
+        # We use RecursiveDataset for training to support nested folders
+        self.ds1 = RecursiveDataset(folder1, image_size)
+        self.ds2 = RecursiveDataset(folder2, image_size)
         
         assert train_batch_size % 2 == 0, "Batch size must be even"
         half_batch = train_batch_size // 2
