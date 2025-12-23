@@ -11,6 +11,8 @@ import numpy as np
 import wandb
 import os
 from datasets import load_dataset
+from torchvision import transforms
+from PIL import Image
 
 # Import from the existing package
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import (
@@ -24,6 +26,30 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch import (
     cycle, 
     loss_backwards
 )
+
+class RecursiveDataset(data.Dataset):
+    def __init__(self, folder, image_size, exts = ['jpg', 'jpeg', 'png', 'tiff', 'bmp', 'webp']):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [p for ext in exts for p in Path(f'{folder}').rglob(f'*.{ext}')]
+
+        self.transform = transforms.Compose([
+            transforms.Resize((int(image_size*1.12), int(image_size*1.12))),
+            transforms.RandomCrop(image_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda t: (t * 2) - 1)
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        img = img.convert('RGB')
+        return self.transform(img)
 
 class HFDataset(data.Dataset):
     def __init__(self, dataset_name, image_size, split='train'):
