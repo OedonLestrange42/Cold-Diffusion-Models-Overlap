@@ -133,4 +133,4 @@ dmypy.json
 
 # wandb & log
 wandb/
-results_decompose*/
+results_*/
