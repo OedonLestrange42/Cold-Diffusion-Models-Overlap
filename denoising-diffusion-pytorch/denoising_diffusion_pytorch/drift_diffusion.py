@@ -52,35 +52,55 @@ class RecursiveDataset(data.Dataset):
         return self.transform(img)
 
 class HFDataset(data.Dataset):
-    def __init__(self, dataset_name, image_size, split='train'):
+    def __init__(self, dataset_name, image_size, split='train', image_key='rawscan'):
         super().__init__()
-        try:
-            self.dataset = load_dataset(dataset_name, split=split)
-        except Exception as e:
-            # Try loading with streaming if it's huge, or just fail
-            print(f"Error loading dataset {dataset_name}: {e}")
-            raise e
+        self.image_key = image_key
+        
+        # Check if dataset_name is a local directory
+        if os.path.isdir(dataset_name):
+            # If it contains parquet files, use the parquet builder
+            if any(f.endswith('.parquet') for f in os.listdir(dataset_name)):
+                print(f"Loading local parquet dataset from {dataset_name}")
+                self.dataset = load_dataset("parquet", data_dir=dataset_name, split=split)
+            else:
+                # Fallback to standard load (e.g. arrow or script)
+                try:
+                    self.dataset = load_dataset(dataset_name, split=split)
+                except Exception:
+                    # Try imagefolder
+                    try:
+                        self.dataset = load_dataset("imagefolder", data_dir=dataset_name, split=split)
+                    except Exception as e:
+                        print(f"Failed to load as imagefolder: {e}")
+                        raise e
+        else:
+            try:
+                self.dataset = load_dataset(dataset_name, split=split)
+            except Exception as e:
+                print(f"Error loading dataset {dataset_name}: {e}")
+                raise e
             
         self.image_size = image_size
         
-        # Determine image column name (simple heuristic)
-        self.image_key = 'image'
-        if 'image' not in self.dataset.features:
+        # Verify image_key exists
+        if self.image_key not in self.dataset.features:
+             print(f"Warning: '{self.image_key}' not found in dataset features: {list(self.dataset.features.keys())}")
              # Fallback or search for Image feature
-             for key, feature in self.dataset.features.items():
-                 # Check if the feature is an Image type (needs datasets.Image) or just guess by name
-                 if key in ['img', 'image', 'picture', 'file']:
+             for key in self.dataset.features.keys():
+                 if key in ['img', 'image', 'picture', 'file', 'rawscan']:
                      self.image_key = key
+                     print(f"Fallback: using column '{self.image_key}'")
                      break
         
         print(f"Using column '{self.image_key}' as image source for {dataset_name}")
+        print(f"Dataset length: {len(self.dataset)}")
 
-        self.transform = utils.transforms.Compose([
-            utils.transforms.Resize((int(image_size*1.12), int(image_size*1.12))),
-            utils.transforms.RandomCrop(image_size),
-            utils.transforms.RandomHorizontalFlip(),
-            utils.transforms.ToTensor(),
-            utils.transforms.Lambda(lambda t: (t * 2) - 1)
+        self.transform = transforms.Compose([
+            transforms.Resize((int(image_size*1.12), int(image_size*1.12))),
+            transforms.RandomCrop(image_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda t: (t * 2) - 1)
         ])
 
     def __len__(self):
@@ -89,6 +109,18 @@ class HFDataset(data.Dataset):
     def __getitem__(self, index):
         item = self.dataset[index]
         img = item[self.image_key]
+        
+        # Handle different image formats (PIL, bytes, path)
+        if not isinstance(img, Image.Image):
+            if isinstance(img, bytes):
+                import io
+                img = Image.open(io.BytesIO(img))
+            elif isinstance(img, str) and os.path.exists(img):
+                img = Image.open(img)
+            elif isinstance(img, dict) and 'bytes' in img:
+                import io
+                img = Image.open(io.BytesIO(img['bytes']))
+        
         if img.mode != 'RGB':
             img = img.convert('RGB')
         return self.transform(img)
@@ -261,9 +293,34 @@ class DriftTrainer(Trainer):
         })
 
         # Setup Datasets
-        # We use RecursiveDataset for training to support nested folders
-        self.ds1 = RecursiveDataset(folder1, image_size)
-        self.ds2 = RecursiveDataset(folder2, image_size)
+        # Helper to choose dataset type
+        def create_dataset(folder, image_size):
+            # 1. Try RecursiveDataset (local image folder)
+            try:
+                ds = RecursiveDataset(folder, image_size)
+                if len(ds) > 0:
+                    print(f"Loaded RecursiveDataset from {folder} with {len(ds)} images")
+                    return ds
+            except Exception as e:
+                print(f"RecursiveDataset failed for {folder}: {e}")
+
+            # 2. Try HFDataset (Hugging Face dataset or local parquet)
+            print(f"Trying HFDataset for {folder}...")
+            try:
+                # We can try to guess image_key or let it default/fallback
+                # If the user specifically mentioned 'rawscan', we can try passing it if we could, 
+                # but HFDataset now has logic to detect 'rawscan'.
+                ds = HFDataset(folder, image_size, split='train')
+                if len(ds) > 0:
+                    print(f"Loaded HFDataset from {folder} with {len(ds)} samples")
+                    return ds
+            except Exception as e:
+                print(f"HFDataset failed for {folder}: {e}")
+            
+            raise ValueError(f"Could not create non-empty dataset for {folder}. Checked RecursiveDataset and HFDataset.")
+
+        self.ds1 = create_dataset(folder1, image_size)
+        self.ds2 = create_dataset(folder2, image_size)
         
         assert train_batch_size % 2 == 0, "Batch size must be even"
         half_batch = train_batch_size // 2
