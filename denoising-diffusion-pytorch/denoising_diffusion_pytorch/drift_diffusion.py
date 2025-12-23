@@ -9,6 +9,8 @@ from torch.optim import Adam
 import torchvision.utils as utils
 import numpy as np
 import wandb
+import os
+from datasets import load_dataset
 
 # Import from the existing package
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import (
@@ -22,6 +24,48 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch import (
     cycle, 
     loss_backwards
 )
+
+class HFDataset(data.Dataset):
+    def __init__(self, dataset_name, image_size, split='train'):
+        super().__init__()
+        try:
+            self.dataset = load_dataset(dataset_name, split=split)
+        except Exception as e:
+            # Try loading with streaming if it's huge, or just fail
+            print(f"Error loading dataset {dataset_name}: {e}")
+            raise e
+            
+        self.image_size = image_size
+        
+        # Determine image column name (simple heuristic)
+        self.image_key = 'image'
+        if 'image' not in self.dataset.features:
+             # Fallback or search for Image feature
+             for key, feature in self.dataset.features.items():
+                 # Check if the feature is an Image type (needs datasets.Image) or just guess by name
+                 if key in ['img', 'image', 'picture', 'file']:
+                     self.image_key = key
+                     break
+        
+        print(f"Using column '{self.image_key}' as image source for {dataset_name}")
+
+        self.transform = utils.transforms.Compose([
+            utils.transforms.Resize((int(image_size*1.12), int(image_size*1.12))),
+            utils.transforms.RandomCrop(image_size),
+            utils.transforms.RandomHorizontalFlip(),
+            utils.transforms.ToTensor(),
+            utils.transforms.Lambda(lambda t: (t * 2) - 1)
+        ])
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        img = item[self.image_key]
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return self.transform(img)
 
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps

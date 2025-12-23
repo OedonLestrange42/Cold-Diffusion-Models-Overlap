@@ -10,8 +10,8 @@ parser.add_argument('--time_steps', default=50, type=int,
 parser.add_argument('--train_steps', default=700000, type=int,
                     help='The number of iterations for training.')
 parser.add_argument('--save_folder', default='./results_drift', type=str)
-parser.add_argument('--path1', type=str, required=True, help='Path to first image category')
-parser.add_argument('--path2', type=str, required=True, help='Path to second image category')
+parser.add_argument('--path1', type=str, required=True, help='Path to first image category (Local folder)')
+parser.add_argument('--path2', type=str, required=True, help='Path to second image category (Local folder or HuggingFace Dataset name)')
 parser.add_argument('--load_path', default=None, type=str)
 parser.add_argument('--train_routine', default='Final', type=str)
 parser.add_argument('--sampling_routine', default='default', type=str)
