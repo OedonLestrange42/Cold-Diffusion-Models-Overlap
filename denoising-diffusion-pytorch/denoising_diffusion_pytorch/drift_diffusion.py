@@ -46,10 +46,14 @@ class RecursiveDataset(data.Dataset):
         return len(self.paths)
 
     def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        img = img.convert('RGB')
-        return self.transform(img)
+        try:
+            path = self.paths[index]
+            img = Image.open(path)
+            img = img.convert('RGB')
+            return self.transform(img)
+        except (OSError, Exception) as e:
+            print(f"Skipping corrupted image {self.paths[index]}: {e}")
+            return self.__getitem__(np.random.randint(0, len(self.paths)))
 
 class HFDataset(data.Dataset):
     def __init__(self, dataset_name, image_size, split='train', image_key='rawscan'):
@@ -107,23 +111,27 @@ class HFDataset(data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        item = self.dataset[index]
-        img = item[self.image_key]
-        
-        # Handle different image formats (PIL, bytes, path)
-        if not isinstance(img, Image.Image):
-            if isinstance(img, bytes):
-                import io
-                img = Image.open(io.BytesIO(img))
-            elif isinstance(img, str) and os.path.exists(img):
-                img = Image.open(img)
-            elif isinstance(img, dict) and 'bytes' in img:
-                import io
-                img = Image.open(io.BytesIO(img['bytes']))
-        
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        return self.transform(img)
+        try:
+            item = self.dataset[index]
+            img = item[self.image_key]
+            
+            # Handle different image formats (PIL, bytes, path)
+            if not isinstance(img, Image.Image):
+                if isinstance(img, bytes):
+                    import io
+                    img = Image.open(io.BytesIO(img))
+                elif isinstance(img, str) and os.path.exists(img):
+                    img = Image.open(img)
+                elif isinstance(img, dict) and 'bytes' in img:
+                    import io
+                    img = Image.open(io.BytesIO(img['bytes']))
+            
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            return self.transform(img)
+        except (OSError, Exception) as e:
+            print(f"Skipping corrupted image at index {index}: {e}")
+            return self.__getitem__(np.random.randint(0, len(self.dataset)))
 
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
